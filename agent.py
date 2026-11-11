@@ -684,6 +684,8 @@ PIPO_USER = os.getenv("PIPO_USER", "").strip()
 PIPO_PASSWORD = os.getenv("PIPO_PASSWORD", "")
 PIPO_ICO_PATH = os.getenv("PIPO_ICO_SERVICE_PATH",
                           "/IntegratedConfigurationInService/IntegratedConfigurationInImplBean").strip()
+PIPO_CHANNEL_PATH = os.getenv("PIPO_CHANNEL_SERVICE_PATH",
+                              "/CommunicationChannelInService/CommunicationChannelInImplBean").strip()
 PIPO_VERIFY_TLS = os.getenv("PIPO_VERIFY_TLS", "true").strip().lower() not in ("false", "0", "no")
 PIPO_TIMEOUT = float(os.getenv("PIPO_TIMEOUT_SECONDS", "30"))
 
@@ -775,6 +777,216 @@ def fetch_scenarios() -> dict:
         raise PipoError(f"{PIPO_SYSTEM} returned HTTP {r.status_code}.")
     return {"system": PIPO_SYSTEM, "count": len(rows), "scenarios": rows,
             "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+
+
+# ---- scenario details (ICo read + channel read), still read-only
+_SENSITIVE_ATTR = re.compile(r"(?i)pass|pwd|secret|token|key|credential|cert|auth|user|login|proxy")
+_USEFUL_ATTR = re.compile(r"(?i)url|host|port|path|dir|file|target|address|timeout|client|program|destination|"
+                          r"system|queue|topic|table|service|endpoint|qos|charset|encoding")
+
+
+def _x(text: str) -> str:
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _children(el) -> dict:
+    return {_local(c.tag): (c.text or "").strip() for c in el}
+
+
+def _desc_text(el) -> str:
+    for d in el.iter():
+        if _local(d.tag) == "Description":
+            vals = [(v.text or "").strip() for v in d.iter() if _local(v.tag) == "Value" and (v.text or "").strip()]
+            return vals[0] if vals else (d.text or "").strip()
+    return ""
+
+
+def _soap(body_xml: str) -> str:
+    return ('<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
+            'xmlns:bas="http://sap.com/xi/BASIS"><soapenv:Header/><soapenv:Body>'
+            f'{body_xml}</soapenv:Body></soapenv:Envelope>')
+
+
+def _pipo_call(path: str, envelope: str, what: str) -> ET.Element:
+    """POST a read request; map transport/HTTP problems to PipoError; return the parsed XML root."""
+    url = PIPO_BASE_URL + path
+    host = urlparse(url).netloc
+    try:
+        r = _pipo_post(url, envelope)
+    except httpx.TimeoutException:
+        raise PipoError(f"{PIPO_SYSTEM} at {host} did not answer within {PIPO_TIMEOUT:.0f} seconds.")
+    except httpx.HTTPError:
+        raise PipoError(f"Cannot reach {PIPO_SYSTEM} at {host}. Check that you are on the company network or VPN.")
+    if r.status_code in (401, 403, 404):
+        raise PipoError({401: f"{PIPO_SYSTEM} rejected PIPO_USER (HTTP 401) while reading {what}.",
+                         403: f"PIPO_USER may not read {what} on {PIPO_SYSTEM} (HTTP 403).",
+                         404: f"The {what} service was not found on {PIPO_SYSTEM} (HTTP 404). Check the service path in .env."
+                         }[r.status_code])
+    try:
+        root = ET.fromstring(r.text)
+    except ET.ParseError:
+        raise PipoError(f"{PIPO_SYSTEM} answered with HTTP {r.status_code} but not SOAP XML while reading {what}.")
+    for el in root.iter():
+        if _local(el.tag) == "Fault":
+            msg = next((c.text for c in el.iter() if _local(c.tag) in ("faultstring", "Text") and c.text), "SOAP fault")
+            raise PipoError(f"{PIPO_SYSTEM} returned an error while reading {what}: {redact(msg.strip())[:300]}")
+    return root
+
+
+def parse_ico_read_response(root: ET.Element) -> dict:
+    """Extract channels, receivers, interfaces, mappings, QoS and conditions from an ICo read response."""
+    ico = next((el for el in root.iter() if _local(el.tag) == "IntegratedConfiguration"), root)
+    info = {"description": _desc_text(ico), "sender_channel": None, "receivers": [], "receiver_interfaces": [],
+            "receiver_channels": [], "quality_of_service": "", "has_conditions": False}
+    for el in ico.iter():
+        tag = _local(el.tag)
+        if tag == "QualityOfService" and not info["quality_of_service"]:
+            info["quality_of_service"] = (el.text or "").strip()
+        elif tag in ("Condition", "AtomicCondition", "AtomicConditionBlock") and "".join(el.itertext()).strip():
+            info["has_conditions"] = True
+        elif tag == "InboundProcessing" and info["sender_channel"] is None:
+            ch = next((c for c in el.iter() if _local(c.tag) == "CommunicationChannel"), None)
+            if ch is not None:
+                f = _children(ch)
+                info["sender_channel"] = {"party": f.get("PartyID", ""), "component": f.get("ComponentID", ""),
+                                          "channel": f.get("ChannelID", "")}
+        elif tag == "ReceiverInterfaces":
+            rcv = next((c for c in el if _local(c.tag) == "Receiver"), None)
+            receiver = _children(rcv).get("ComponentID", "") if rcv is not None else ""
+            for rule in el.iter():
+                if _local(rule.tag) != "ReceiverInterfaceRule":
+                    continue
+                iface = next((c for c in rule if _local(c.tag) == "Interface"), None)
+                mapping = next((c for c in rule if _local(c.tag) == "Mapping"), None)
+                info["receiver_interfaces"].append({
+                    "receiver": receiver,
+                    "interface": _children(iface).get("Name", "") if iface is not None else "",
+                    "namespace": _children(iface).get("Namespace", "") if iface is not None else "",
+                    "mapping": _children(mapping).get("Name", "") if mapping is not None else "",
+                })
+        elif tag == "OutboundProcessing":
+            rcv = next((c for c in el.iter() if _local(c.tag) == "Receiver"), None)
+            ch = next((c for c in el.iter() if _local(c.tag) == "CommunicationChannel"), None)
+            if ch is not None:
+                f = _children(ch)
+                info["receiver_channels"].append({
+                    "receiver": _children(rcv).get("ComponentID", "") if rcv is not None else f.get("ComponentID", ""),
+                    "party": f.get("PartyID", ""), "component": f.get("ComponentID", ""), "channel": f.get("ChannelID", "")})
+        elif tag == "Receiver":
+            comp = _children(el).get("ComponentID", "")
+            if comp and comp not in info["receivers"]:
+                info["receivers"].append(comp)
+    return info
+
+
+def parse_channel_read_response(root: ET.Element) -> dict:
+    """Map (component, channel) -> adapter facts; sensitive attributes are never kept."""
+    out = {}
+    for ch in root.iter():
+        if _local(ch.tag) != "CommunicationChannel" or not any(_local(c.tag) == "AdapterMetadata" for c in ch):
+            continue
+        cid = next((c for c in ch if _local(c.tag) == "CommunicationChannelID"), None)
+        ids = _children(cid) if cid is not None else {}
+        meta = _children(next(c for c in ch if _local(c.tag) == "AdapterMetadata"))
+        top = _children(ch)
+        attrs = {}
+        for a in ch.iter():
+            if _local(a.tag) != "AdapterSpecificAttribute":
+                continue
+            f = _children(a)
+            name, value = f.get("Name", ""), f.get("Value", "")
+            if name and value and _USEFUL_ATTR.search(name) and not _SENSITIVE_ATTR.search(name):
+                attrs[name] = redact(value)[:200]
+        out[(ids.get("ComponentID", ""), ids.get("ChannelID", ""))] = {
+            "adapter": meta.get("Name", ""), "direction": top.get("Direction", ""),
+            "transport": top.get("TransportProtocol", ""), "message_protocol": top.get("MessageProtocol", ""),
+            "attributes": dict(list(attrs.items())[:8])}
+    return out
+
+
+def _qos_text(qos: str) -> str:
+    q = qos.replace(" ", "").lower()
+    if q == "besteffort":
+        return "synchronous (Best Effort)"
+    if q in ("exactlyonce", "exactlyonceinorder"):
+        return f"asynchronous ({qos})"
+    return qos or "unknown"
+
+
+def render_po_export(row: dict, info: dict) -> str:
+    """Plain-text ICo summary in the shape the agents and detect_pattern understand."""
+    def chan(c):
+        if not c:
+            return "unknown"
+        a = c.get("details") or {}
+        parts = [f"{c['channel']} (component {c['component']})"]
+        if a.get("adapter"):
+            parts.append(f"adapter {a['adapter']}")
+        if a.get("transport") or a.get("message_protocol"):
+            parts.append(f"transport {a.get('transport') or '?'}, message protocol {a.get('message_protocol') or '?'}")
+        if a.get("attributes"):
+            parts.append("; ".join(f"{k}={v}" for k, v in a["attributes"].items()))
+        return ", ".join(parts)
+
+    lines = [f"Source: {PIPO_SYSTEM} Integration Directory (read-only)",
+             f"Integrated Configuration: {row['scenario_string']}"]
+    if info["description"]:
+        lines.append(f"Description: {info['description']}")
+    lines.append(f"Quality of service: {_qos_text(info['quality_of_service'])}")
+    lines.append(f"Sender channel: {chan(info['sender_channel'])}")
+    for comp in info["receivers"]:
+        lines.append(f"Receiver component: {comp}")
+    for ri in info["receiver_interfaces"]:
+        lines.append(f"  Receiver interface ({ri['receiver']}): {ri['interface']} ({ri['namespace']})"
+                     + (f", operation mapping {ri['mapping']}" if ri["mapping"] else ", no mapping"))
+    for rc in info["receiver_channels"]:
+        lines.append(f"  Receiver channel ({rc['receiver']}): {chan(rc)}")
+    lines.append("Routing: content-based, receivers chosen by XPath condition" if info["has_conditions"]
+                 else "Routing: static, every receiver gets every message")
+    return "\n".join(lines)
+
+
+def fetch_scenario_details(row: dict) -> dict:
+    """Read one ICo and its channels from the PI/PO system; returns structured info plus po_export text."""
+    if not pipo_configured():
+        raise PipoError(f"{PIPO_SYSTEM} is not connected here, so scenario details cannot be read.")
+    row = {k: str(row.get(k, "") or "") for k in _ICO_KEYS}
+    if not row["interface"]:
+        raise GuardrailViolation("A scenario needs at least an interface name.")
+    for v in row.values():
+        guard_input(v, check_scope=False, label="scenario")
+    row["scenario_string"] = "|".join(row[k] for k in _ICO_KEYS)
+    ico_id = ("<IntegratedConfigurationID>"
+              f"<SenderPartyID>{_x(row['sender_party'])}</SenderPartyID>"
+              f"<SenderComponentID>{_x(row['sender_component'])}</SenderComponentID>"
+              f"<InterfaceName>{_x(row['interface'])}</InterfaceName>"
+              f"<InterfaceNamespace>{_x(row['namespace'])}</InterfaceNamespace>"
+              f"<ReceiverPartyID>{_x(row['receiver_party'])}</ReceiverPartyID>"
+              f"<ReceiverComponentID>{_x(row['receiver_component'])}</ReceiverComponentID>"
+              "</IntegratedConfigurationID>")
+    root = _pipo_call(PIPO_ICO_PATH, _soap("<bas:IntegratedConfigurationReadRequest><ReadContext>Active</ReadContext>"
+                                           f"{ico_id}</bas:IntegratedConfigurationReadRequest>"),
+                      "the Integrated Configuration")
+    if not any(_local(el.tag) == "IntegratedConfiguration" for el in root.iter()):
+        raise PipoError(f"{PIPO_SYSTEM} did not return this Integrated Configuration. It may have been changed or deleted.")
+    info = parse_ico_read_response(root)
+    warnings = []
+    channels = [c for c in [info["sender_channel"], *info["receiver_channels"]] if c and c.get("channel")]
+    if channels:
+        ids = "".join(f"<CommunicationChannelID><PartyID>{_x(c['party'])}</PartyID><ComponentID>{_x(c['component'])}"
+                      f"</ComponentID><ChannelID>{_x(c['channel'])}</ChannelID></CommunicationChannelID>"
+                      for c in channels)
+        try:
+            croot = _pipo_call(PIPO_CHANNEL_PATH, _soap("<bas:CommunicationChannelReadRequest><ReadContext>Active"
+                                                        f"</ReadContext>{ids}</bas:CommunicationChannelReadRequest>"),
+                               "communication channels")
+            facts = parse_channel_read_response(croot)
+            for c in channels:
+                c["details"] = facts.get((c["component"], c["channel"]))
+        except PipoError as exc:
+            warnings.append(f"Channel details unavailable: {exc}")
+    return {"system": PIPO_SYSTEM, "scenario": row, "details": info, "po_export": render_po_export(row, info),
+            "warnings": warnings}
 
 
 def describe() -> dict:
@@ -1001,6 +1213,46 @@ SAMPLE_ICO_RESPONSE = (
 )
 
 
+SAMPLE_ICO_READ = (
+    '<e:Envelope xmlns:e="http://schemas.xmlsoap.org/soap/envelope/"><e:Body><r:IntegratedConfigurationReadResponse '
+    'xmlns:r="http://sap.com/xi/BASIS"><IntegratedConfiguration><Description><Value>Orders by type</Value></Description>'
+    '<InboundProcessing><CommunicationChannel><PartyID/><ComponentID>BS_EDI_GW</ComponentID><ChannelID>CC_AS2_Sender'
+    '</ChannelID></CommunicationChannel></InboundProcessing><Receivers><ReceiverRule><Receiver><ComponentID>BS_ERP'
+    '</ComponentID></Receiver><Condition><AtomicConditionBlock><AtomicCondition><Operator>EQ</Operator>'
+    '</AtomicCondition></AtomicConditionBlock></Condition></ReceiverRule><ReceiverRule><Receiver><ComponentID>BS_WMS'
+    '</ComponentID></Receiver></ReceiverRule></Receivers><ReceiverInterfaces><Receiver><ComponentID>BS_ERP</ComponentID>'
+    '</Receiver><ReceiverInterfaceRule><Mapping><Name>OM_Order</Name></Mapping><Interface><Name>ORDERS.ORDERS05</Name>'
+    '<Namespace>urn:sap-com:document:sap:idoc:messages</Namespace></Interface></ReceiverInterfaceRule>'
+    '<QualityOfService>ExactlyOnce</QualityOfService></ReceiverInterfaces><OutboundProcessing><Receiver><ComponentID>'
+    'BS_ERP</ComponentID></Receiver><CommunicationChannel><PartyID/><ComponentID>BS_ERP</ComponentID><ChannelID>'
+    'CC_IDOC_Receiver</ChannelID></CommunicationChannel></OutboundProcessing></IntegratedConfiguration>'
+    '</r:IntegratedConfigurationReadResponse></e:Body></e:Envelope>'
+)
+SAMPLE_CHANNEL_READ = (
+    '<e:Envelope xmlns:e="http://schemas.xmlsoap.org/soap/envelope/"><e:Body><r:CommunicationChannelReadResponse '
+    'xmlns:r="http://sap.com/xi/BASIS"><CommunicationChannel><CommunicationChannelID><PartyID/><ComponentID>BS_ERP'
+    '</ComponentID><ChannelID>CC_IDOC_Receiver</ChannelID></CommunicationChannelID><AdapterMetadata><Name>IDoc_AAE'
+    '</Name></AdapterMetadata><Direction>Receiver</Direction><TransportProtocol>HTTP</TransportProtocol>'
+    '<MessageProtocol>IDoc</MessageProtocol><AdapterSpecificAttribute><Name>rfc.client</Name><Value>300</Value>'
+    '</AdapterSpecificAttribute><AdapterSpecificAttribute><Name>rfc.password</Name><Value>idocPW#1</Value>'
+    '</AdapterSpecificAttribute></CommunicationChannel></r:CommunicationChannelReadResponse></e:Body></e:Envelope>'
+)
+
+
+def _details_case() -> tuple[bool, str]:
+    info = parse_ico_read_response(ET.fromstring(SAMPLE_ICO_READ))
+    facts = parse_channel_read_response(ET.fromstring(SAMPLE_CHANNEL_READ))
+    for c in [info["sender_channel"], *info["receiver_channels"]]:
+        c["details"] = facts.get((c["component"], c["channel"]))
+    row = {"scenario_string": "|BS_EDI_GW|OrderCreate_Out|urn:partner:orders||"}
+    text = render_po_export(row, info)
+    pattern = json.loads(detect_pattern.invoke({"ico_text": text}))["pattern"]
+    ok = (info["sender_channel"]["channel"] == "CC_AS2_Sender" and set(info["receivers"]) == {"BS_ERP", "BS_WMS"}
+          and info["has_conditions"] and "IDoc_AAE" in text and "rfc.client=300" in text and "idocPW" not in text
+          and "asynchronous" in text and pattern == "Content-Based Routing")
+    return ok, f"pattern={pattern}; {text.count(chr(10)) + 1} lines"
+
+
 def _raises_pipo(fn) -> tuple[bool, str]:
     try:
         fn()
@@ -1096,6 +1348,7 @@ def _deterministic_cases() -> list[dict]:
             '<e:Envelope xmlns:e="http://schemas.xmlsoap.org/soap/envelope/"><e:Body><e:Fault>'
             '<faultstring>No authorization</faultstring></e:Fault></e:Body></e:Envelope>'))),
         _case("Get scenarios without S45 settings explains local-only", "pipo", _not_configured_message),
+        _case("Scenario details parsed, passwords dropped, pattern detected", "pipo", _details_case),
         _case("Output validator catches missing keys", "loop", lambda: (
             validate_output({"summary": "x"}, AGENTS["test"].schema) != [], "caught")),
         _case("JSON parser handles code fences", "loop", lambda: (

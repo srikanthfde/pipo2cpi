@@ -149,13 +149,39 @@ function StageCard({ index, stage, result }) {
   );
 }
 
-function ScenarioBrowser({ meta, onPick }) {
+function ScenarioDetails({ d }) {
+  const chan = (c) => {
+    if (!c) return "unknown";
+    const a = c.details || {};
+    return [c.channel, a.adapter && `${a.adapter}${a.direction ? ` · ${a.direction}` : ""}`].filter(Boolean).join(" — ");
+  };
+  return (
+    <div className="kv" style={{ marginTop: 12 }}>
+      {d.description && <><div className="k">description</div><div>{d.description}</div></>}
+      <div className="k">quality of service</div><div>{d.quality_of_service || "unknown"}</div>
+      <div className="k">sender channel</div><div>{chan(d.sender_channel)}</div>
+      <div className="k">receivers</div><div>{d.receivers.join(", ") || "—"}</div>
+      <div className="k">interfaces / mappings</div>
+      <div>{d.receiver_interfaces.length ? d.receiver_interfaces.map((r, i) => (
+        <div key={i}>{r.receiver}: {r.interface}{r.mapping ? ` ← ${r.mapping}` : " (no mapping)"}</div>)) : "—"}</div>
+      <div className="k">receiver channels</div>
+      <div>{d.receiver_channels.length ? d.receiver_channels.map((c, i) => <div key={i}>{c.receiver}: {chan(c)}</div>) : "—"}</div>
+      <div className="k">routing conditions</div><div>{d.has_conditions ? "yes" : "none"}</div>
+    </div>
+  );
+}
+
+function ScenarioBrowser({ meta, onPick, onDetails }) {
   const system = meta.pipo?.system || "S45";
   const [data, setData] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [query, setQuery] = useState("");
   const [picked, setPicked] = useState("");
+  const [detail, setDetail] = useState(null);
+  const [detailBusy, setDetailBusy] = useState(false);
+  const [detailErr, setDetailErr] = useState("");
+  const latest = useRef("");
 
   async function load() {
     setBusy(true); setError("");
@@ -166,12 +192,23 @@ function ScenarioBrowser({ meta, onPick }) {
   const q = query.trim().toLowerCase();
   const rows = (data?.scenarios || []).filter((r) => !q || r.scenario_string.toLowerCase().includes(q));
 
-  function pick(r) {
-    setPicked(r.scenario_string);
-    onPick({
+  async function pick(r) {
+    if (onPick({
       po_system: system, sender_party: r.sender_party, sender_component: r.sender_component,
       sender_interface: r.interface, namespace: r.namespace, receiver_component: r.receiver_component,
-    });
+    }) === false) return;
+    setPicked(r.scenario_string);
+    latest.current = r.scenario_string;
+    setDetail(null); setDetailErr(""); setDetailBusy(true);
+    try {
+      const d = await api("/api/scenarios/details", r);
+      if (latest.current !== r.scenario_string) return;
+      setDetail(d);
+      onDetails(d.po_export);
+    } catch (e) {
+      if (latest.current === r.scenario_string) setDetailErr(e.message);
+    }
+    if (latest.current === r.scenario_string) setDetailBusy(false);
   }
 
   return (
@@ -208,7 +245,16 @@ function ScenarioBrowser({ meta, onPick }) {
           </table>
         </div>
       )}
-      {data && <p className="sub" style={{ margin: "8px 0 0", fontSize: 12 }}>Click a scenario to load it into the pipeline form below.</p>}
+      {data && <p className="sub" style={{ margin: "8px 0 0", fontSize: 12 }}>Click a scenario to load it and its channel details into the pipeline form below.</p>}
+      {detailBusy && <p className="sub" style={{ margin: "10px 0 0" }}><span className="spin" /> Reading scenario details from {system}...</p>}
+      {detailErr && <div className="warn">Details not loaded: {detailErr} The scenario IDs are still filled in.</div>}
+      {detail && (
+        <div className="out">
+          <div className="eyebrow">Scenario details from {system}</div>
+          <ScenarioDetails d={detail.details} />
+          {detail.warnings?.map((w, i) => <div className="warn" key={i}>{w}</div>)}
+        </div>
+      )}
     </div>
   );
 }
@@ -270,11 +316,12 @@ function Pipeline({ meta }) {
   return (
     <>
     <ScenarioBrowser meta={meta} onPick={(f) => {
-      if (running) return;
+      if (running) return false;
       setIco((prev) => ({ ...prev, po_export: "", mapping_code: "", sample_input: "", expected_output: "",
                           actual_output: "", mpl_error: "", ...f }));
       setResults({}); setGateAt(null);
-    }} />
+      return true;
+    }} onDetails={(text) => setIco((prev) => ({ ...prev, po_export: text }))} />
     <div className="grid">
       <div className="panel">
         <div className="eyebrow">Integrated Configuration</div>

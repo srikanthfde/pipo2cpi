@@ -35,6 +35,15 @@ class ChatRequest(BaseModel):
     history: list[dict] = []
 
 
+class ScenarioRequest(BaseModel):
+    sender_party: str = ""
+    sender_component: str = ""
+    interface: str
+    namespace: str = ""
+    receiver_party: str = ""
+    receiver_component: str = ""
+
+
 class EvalRequest(BaseModel):
     include_llm: bool = False
 
@@ -73,6 +82,11 @@ def agents():
 @app.get("/api/scenarios")
 def scenarios():
     return _call(agent.fetch_scenarios)
+
+
+@app.post("/api/scenarios/details")
+def scenario_details(req: ScenarioRequest):
+    return _call(agent.fetch_scenario_details, req.model_dump())
 
 
 @app.post("/api/stage")
