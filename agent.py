@@ -17,6 +17,8 @@ import re
 import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -675,9 +677,110 @@ _register(AgentSpec(
 PIPELINE = ["assessment", "wizard_prep", "mapping", "config", "test", "monitor_docs"]
 
 
+# ============================================================== SAP PI/PO connection (read-only, local only)
+PIPO_SYSTEM = os.getenv("PIPO_SYSTEM_NAME", "S45").strip() or "S45"
+PIPO_BASE_URL = os.getenv("PIPO_BASE_URL", "").strip().rstrip("/")
+PIPO_USER = os.getenv("PIPO_USER", "").strip()
+PIPO_PASSWORD = os.getenv("PIPO_PASSWORD", "")
+PIPO_ICO_PATH = os.getenv("PIPO_ICO_SERVICE_PATH",
+                          "/IntegratedConfigurationInService/IntegratedConfigurationInImplBean").strip()
+PIPO_VERIFY_TLS = os.getenv("PIPO_VERIFY_TLS", "true").strip().lower() not in ("false", "0", "no")
+PIPO_TIMEOUT = float(os.getenv("PIPO_TIMEOUT_SECONDS", "30"))
+
+ICO_QUERY_ENVELOPE = (
+    '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
+    'xmlns:bas="http://sap.com/xi/BASIS"><soapenv:Header/><soapenv:Body>'
+    '<bas:IntegratedConfigurationQueryRequest/></soapenv:Body></soapenv:Envelope>'
+)
+_ICO_KEYS = ("sender_party", "sender_component", "interface", "namespace", "receiver_party", "receiver_component")
+_ICO_FIELDS = {"SenderPartyID": "sender_party", "SenderComponentID": "sender_component",
+               "InterfaceName": "interface", "InterfaceNamespace": "namespace",
+               "ReceiverPartyID": "receiver_party", "ReceiverComponentID": "receiver_component"}
+
+
+class PipoError(Exception):
+    """The PI/PO system is not configured here or did not answer. Shown to the user as a 503."""
+
+
+def pipo_configured() -> bool:
+    return bool(PIPO_BASE_URL and PIPO_USER and PIPO_PASSWORD)
+
+
+def _local(tag: str) -> str:
+    return tag.split("}")[-1]
+
+
+def parse_ico_query_response(xml_text: str) -> list[dict]:
+    """Turn an Integration Directory IntegratedConfigurationQueryResponse into scenario rows."""
+    root = ET.fromstring(xml_text)
+    for el in root.iter():
+        if _local(el.tag) == "Fault":
+            msg = next((c.text for c in el.iter() if _local(c.tag) in ("faultstring", "Text") and c.text), "SOAP fault")
+            raise PipoError(f"{PIPO_SYSTEM} returned an error: {redact(msg.strip())[:300]}")
+    rows, seen = [], set()
+    for el in root.iter():
+        if _local(el.tag) != "IntegratedConfigurationID":
+            continue
+        row = dict.fromkeys(_ICO_KEYS, "")
+        for child in el:
+            key = _ICO_FIELDS.get(_local(child.tag))
+            if key:
+                row[key] = (child.text or "").strip()
+        row["scenario_string"] = "|".join(row[k] for k in _ICO_KEYS)
+        if row["interface"] and row["scenario_string"] not in seen:
+            seen.add(row["scenario_string"])
+            rows.append(row)
+    rows.sort(key=lambda r: (r["sender_component"].lower(), r["interface"].lower()))
+    return rows
+
+
+def _pipo_post(url: str, body: str) -> httpx.Response:
+    with httpx.Client(timeout=PIPO_TIMEOUT, verify=PIPO_VERIFY_TLS, auth=(PIPO_USER, PIPO_PASSWORD)) as client:
+        return client.post(url, content=body.encode("utf-8"),
+                           headers={"Content-Type": "text/xml; charset=utf-8", "SOAPAction": '""'})
+
+
+def fetch_scenarios() -> dict:
+    """Read-only query of all Integrated Configurations in the PI/PO Integration Directory."""
+    if not pipo_configured():
+        raise PipoError(f"{PIPO_SYSTEM} is not connected here. Get scenarios only works when PIPO2CPI runs on your "
+                        f"PC on the company network or VPN, with PIPO_BASE_URL, PIPO_USER and PIPO_PASSWORD set in .env.")
+    url = PIPO_BASE_URL + PIPO_ICO_PATH
+    host = urlparse(url).netloc
+    try:
+        r = _pipo_post(url, ICO_QUERY_ENVELOPE)
+    except httpx.TimeoutException:
+        raise PipoError(f"{PIPO_SYSTEM} at {host} did not answer within {PIPO_TIMEOUT:.0f} seconds.")
+    except httpx.ConnectError as exc:
+        if "CERTIFICATE_VERIFY_FAILED" in str(exc):
+            raise PipoError(f"Your PC does not trust {PIPO_SYSTEM}'s TLS certificate. Ask Basis for the company CA, "
+                            f"or set PIPO_VERIFY_TLS=false in .env for testing only.")
+        raise PipoError(f"Cannot reach {PIPO_SYSTEM} at {host}. Check that you are on the company network or VPN "
+                        f"and that PIPO_BASE_URL has the right host and port.")
+    except httpx.HTTPError as exc:
+        raise PipoError(f"Connection to {PIPO_SYSTEM} failed ({type(exc).__name__}).")
+    if r.status_code == 401:
+        raise PipoError(f"{PIPO_SYSTEM} rejected the user in PIPO_USER (HTTP 401). Check the user and password in .env.")
+    if r.status_code == 403:
+        raise PipoError(f"PIPO_USER has no access to the Integration Directory API on {PIPO_SYSTEM} (HTTP 403). "
+                        f"Ask Basis for a read-only directory API role such as SAP_XI_API_DISPLAY_J2EE.")
+    if r.status_code == 404:
+        raise PipoError(f"The Integrated Configuration service was not found on {PIPO_SYSTEM} (HTTP 404). "
+                        f"Check PIPO_BASE_URL and PIPO_ICO_SERVICE_PATH.")
+    try:
+        rows = parse_ico_query_response(r.text)
+    except ET.ParseError:
+        raise PipoError(f"{PIPO_SYSTEM} answered with HTTP {r.status_code} but not SOAP XML. Check PIPO_BASE_URL.")
+    if r.status_code >= 400:
+        raise PipoError(f"{PIPO_SYSTEM} returned HTTP {r.status_code}.")
+    return {"system": PIPO_SYSTEM, "count": len(rows), "scenarios": rows,
+            "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+
+
 def describe() -> dict:
     return {
         "app": APP_NAME, "model": MODEL, "configured": is_configured(),
+        "pipo": {"system": PIPO_SYSTEM, "configured": pipo_configured()},
         "pipeline": [{"key": k, "title": AGENTS[k].title, "agent_type": AGENTS[k].agent_type,
                       "description": AGENTS[k].description, "tools": AGENTS[k].tools, "gate": AGENTS[k].gate}
                      for k in PIPELINE],
@@ -881,6 +984,43 @@ GOLDEN_SCENARIO = ("|BS_Q96_CL100|MaterialERPAvailabilityQueryResponse_Out|"
                    "urn:tooling.sandvik.com:MarketingBusiness:GlobalDataTypes||")
 
 
+SAMPLE_ICO_RESPONSE = (
+    '<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"><SOAP-ENV:Body>'
+    '<rpl:IntegratedConfigurationQueryResponse xmlns:rpl="http://sap.com/xi/BASIS">'
+    '<IntegratedConfigurationID><SenderPartyID/><SenderComponentID>BS_Q96_CL100</SenderComponentID>'
+    '<InterfaceName>MaterialERPAvailabilityQueryResponse_Out</InterfaceName>'
+    '<InterfaceNamespace>urn:tooling.sandvik.com:MarketingBusiness:GlobalDataTypes</InterfaceNamespace>'
+    '<ReceiverPartyID/><ReceiverComponentID/></IntegratedConfigurationID>'
+    '<IntegratedConfigurationID><SenderPartyID/><SenderComponentID>A17CLNT300</SenderComponentID>'
+    '<InterfaceName>TT75_Out</InterfaceName><InterfaceNamespace>urn:tooling.sandvik.com:TOOLING_SALES_ERP_TT</InterfaceNamespace>'
+    '<ReceiverPartyID/><ReceiverComponentID/></IntegratedConfigurationID>'
+    '<IntegratedConfigurationID><SenderPartyID/><SenderComponentID>A17CLNT300</SenderComponentID>'
+    '<InterfaceName>TT75_Out</InterfaceName><InterfaceNamespace>urn:tooling.sandvik.com:TOOLING_SALES_ERP_TT</InterfaceNamespace>'
+    '<ReceiverPartyID/><ReceiverComponentID/></IntegratedConfigurationID>'
+    '</rpl:IntegratedConfigurationQueryResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>'
+)
+
+
+def _raises_pipo(fn) -> tuple[bool, str]:
+    try:
+        fn()
+    except PipoError as exc:
+        return "No authorization" in str(exc), str(exc)
+    return False, "no error raised"
+
+
+def _not_configured_message() -> tuple[bool, str]:
+    global PIPO_BASE_URL
+    saved, PIPO_BASE_URL = PIPO_BASE_URL, ""
+    try:
+        fetch_scenarios()
+        return False, "no error raised"
+    except PipoError as exc:
+        return "company network" in str(exc), str(exc)
+    finally:
+        PIPO_BASE_URL = saved
+
+
 def _case(name: str, category: str, fn) -> dict:
     try:
         ok, detail = fn()
@@ -949,6 +1089,13 @@ def _deterministic_cases() -> list[dict]:
         _case("Every stage prompt has all six parts", "context", lambda: (all(
             all(h in system_prompt(AGENTS[k]) for h in ("# Role", "# Task", "# Context", "# Example",
                                                          "# Constraints", "# Output format")) for k in PIPELINE), "ok")),
+        _case("Parses PI/PO ICo query and drops duplicates", "pipo", lambda: (lambda rows: (
+            len(rows) == 2 and GOLDEN_SCENARIO in [r["scenario_string"] for r in rows], [r["interface"] for r in rows]))(
+            parse_ico_query_response(SAMPLE_ICO_RESPONSE))),
+        _case("PI/PO SOAP fault becomes a clear error", "pipo", lambda: _raises_pipo(lambda: parse_ico_query_response(
+            '<e:Envelope xmlns:e="http://schemas.xmlsoap.org/soap/envelope/"><e:Body><e:Fault>'
+            '<faultstring>No authorization</faultstring></e:Fault></e:Body></e:Envelope>'))),
+        _case("Get scenarios without S45 settings explains local-only", "pipo", _not_configured_message),
         _case("Output validator catches missing keys", "loop", lambda: (
             validate_output({"summary": "x"}, AGENTS["test"].schema) != [], "caught")),
         _case("JSON parser handles code fences", "loop", lambda: (

@@ -44,7 +44,7 @@ def _call(fn, *args, **kwargs):
         return fn(*args, **kwargs)
     except agent.GuardrailViolation as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    except agent.AgentConfigError as exc:
+    except (agent.AgentConfigError, agent.PipoError) as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Model call failed: {type(exc).__name__}: {str(exc)[:300]}")
@@ -68,6 +68,11 @@ def health():
 @app.get("/api/agents")
 def agents():
     return agent.describe()
+
+
+@app.get("/api/scenarios")
+def scenarios():
+    return _call(agent.fetch_scenarios)
 
 
 @app.post("/api/stage")

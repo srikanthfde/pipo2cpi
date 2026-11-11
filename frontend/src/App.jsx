@@ -48,6 +48,10 @@ details{margin-top:8px}summary{cursor:pointer;color:var(--muted);font-size:12.5p
 .foot{color:var(--muted);font:12px var(--mono);padding:16px 28px;border-top:1px solid var(--line);margin-top:24px}
 .spin{display:inline-block;width:10px;height:10px;border:2px solid var(--warn);border-right-color:transparent;border-radius:50%;animation:s .8s linear infinite}
 @keyframes s{to{transform:rotate(360deg)}}
+.scen{margin-bottom:22px}.scen-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.scen-list{max-height:320px;overflow:auto;margin-top:12px;border:1px solid var(--line);border-radius:8px}
+.scen-list tr{cursor:pointer}.scen-list tr:hover td{background:var(--panel2)}.scen-list tr.on td{background:var(--accent-bg)}
+.scen-list td{font-family:var(--mono);font-size:12px}
 @media(max-width:1000px){.grid{grid-template-columns:1fr}}
 `;
 
@@ -145,6 +149,70 @@ function StageCard({ index, stage, result }) {
   );
 }
 
+function ScenarioBrowser({ meta, onPick }) {
+  const system = meta.pipo?.system || "S45";
+  const [data, setData] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [query, setQuery] = useState("");
+  const [picked, setPicked] = useState("");
+
+  async function load() {
+    setBusy(true); setError("");
+    try { setData(await api("/api/scenarios")); } catch (e) { setError(e.message); setData(null); }
+    setBusy(false);
+  }
+
+  const q = query.trim().toLowerCase();
+  const rows = (data?.scenarios || []).filter((r) => !q || r.scenario_string.toLowerCase().includes(q));
+
+  function pick(r) {
+    setPicked(r.scenario_string);
+    onPick({
+      po_system: system, sender_party: r.sender_party, sender_component: r.sender_component,
+      sender_interface: r.interface, namespace: r.namespace, receiver_component: r.receiver_component,
+    });
+  }
+
+  return (
+    <div className="panel scen">
+      <div className="scen-head">
+        <div>
+          <div className="eyebrow">SAP PI/PO {system}</div>
+          <h3 style={{ margin: 0 }}>Integration Directory scenarios</h3>
+        </div>
+        <button className="primary" disabled={busy} onClick={load}>{busy ? "Fetching..." : "Get scenarios"}</button>
+        {data && <span className="pill ok">{data.count} scenarios · {new Date(data.fetched_at).toLocaleTimeString()}</span>}
+        {data && <input style={{ flex: 1, minWidth: 220 }} value={query} placeholder="Filter by component, interface or namespace..."
+          onChange={(e) => setQuery(e.target.value)} />}
+      </div>
+      {!meta.pipo?.configured && !data && !error && (
+        <p className="sub" style={{ margin: "10px 0 0" }}>{system} is only reachable when PIPO2CPI runs on your PC on the company network or VPN, with the {system} settings in .env.</p>
+      )}
+      {error && <div className="err">{error}</div>}
+      {data && (
+        <div className="scen-list">
+          <table>
+            <thead><tr><th>Sender component</th><th>Interface</th><th>Namespace</th><th>Receiver</th></tr></thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.scenario_string} className={picked === r.scenario_string ? "on" : ""} onClick={() => pick(r)}
+                  title="Use this scenario in the pipeline">
+                  <td>{r.sender_party ? `${r.sender_party} | ` : ""}{r.sender_component}</td>
+                  <td>{r.interface}</td><td>{r.namespace}</td>
+                  <td>{[r.receiver_party, r.receiver_component].filter(Boolean).join(" | ") || "—"}</td>
+                </tr>
+              ))}
+              {!rows.length && <tr><td colSpan={4} className="sub">No scenarios match "{query}".</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {data && <p className="sub" style={{ margin: "8px 0 0", fontSize: 12 }}>Click a scenario to load it into the pipeline form below.</p>}
+    </div>
+  );
+}
+
 function Pipeline({ meta }) {
   const stages = meta.pipeline;
   const [ico, setIco] = useState(EXAMPLE_ICO);
@@ -200,6 +268,13 @@ function Pipeline({ meta }) {
   };
 
   return (
+    <>
+    <ScenarioBrowser meta={meta} onPick={(f) => {
+      if (running) return;
+      setIco((prev) => ({ ...prev, po_export: "", mapping_code: "", sample_input: "", expected_output: "",
+                          actual_output: "", mpl_error: "", ...f }));
+      setResults({}); setGateAt(null);
+    }} />
     <div className="grid">
       <div className="panel">
         <div className="eyebrow">Integrated Configuration</div>
@@ -239,6 +314,7 @@ function Pipeline({ meta }) {
         ))}
       </div>
     </div>
+    </>
   );
 }
 
