@@ -17,6 +17,7 @@ textarea{resize:vertical;min-height:64px}label{display:block;font-size:12px;colo
 .sub{color:var(--muted);font-size:13px}.spacer{flex:1}
 .pill{font:12px var(--mono);padding:3px 9px;border-radius:99px;border:1px solid var(--line);color:var(--muted)}
 .pill.ok{color:var(--ok);border-color:var(--ok)}.pill.err{color:var(--err);border-color:var(--err)}
+.pill.warn{color:var(--warn);border-color:var(--warn)}
 .tabs{display:flex;gap:4px;padding:0 28px;border-bottom:1px solid var(--line)}
 .tab{background:none;border:none;border-bottom:2px solid transparent;border-radius:0;padding:12px 14px;color:var(--muted)}
 .tab.on{color:var(--text);border-bottom-color:var(--accent)}
@@ -220,12 +221,16 @@ function ScenarioBrowser({ meta, onPick, onDetails }) {
         </div>
         <button className="primary" disabled={busy} onClick={load}>{busy ? "Fetching..." : "Get scenarios"}</button>
         {data && <span className="pill ok">{data.count} scenarios · {new Date(data.fetched_at).toLocaleTimeString()}</span>}
+        {data?.demo && <span className="pill warn" title="Built-in test scenarios, not read from a real PI/PO system">test data</span>}
         {data && <input style={{ flex: 1, minWidth: 220 }} value={query} placeholder="Filter by component, interface or namespace..."
           onChange={(e) => setQuery(e.target.value)} />}
       </div>
       {!meta.pipo?.configured && !data && !error && (
-        <p className="sub" style={{ margin: "10px 0 0" }}>{system} is only reachable when PIPO2CPI runs on your PC on the company network or VPN, with the {system} settings in .env.</p>
+        <p className="sub" style={{ margin: "10px 0 0" }}>{meta.pipo?.demo
+          ? `${system} is not connected here, so Get scenarios returns built-in test scenarios. The real ${system} works when PIPO2CPI runs on your PC on the company network or VPN, with the ${system} settings in .env.`
+          : `${system} is only reachable when PIPO2CPI runs on your PC on the company network or VPN, with the ${system} settings in .env.`}</p>
       )}
+      {data?.demo && <p className="sub" style={{ margin: "10px 0 0", fontSize: 12 }}>These are built-in test scenarios, not read from a real {system} system.</p>}
       {error && <div className="err">{error}</div>}
       {data && (
         <div className="scen-list">

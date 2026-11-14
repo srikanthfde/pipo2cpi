@@ -713,6 +713,108 @@ def pipo_configured() -> bool:
     return bool(PIPO_BASE_URL and PIPO_USER and PIPO_PASSWORD)
 
 
+# ---- built-in test data: used only when no real PI/PO is configured (e.g. on Vercel), unless PIPO_DEMO_MODE=false
+PIPO_DEMO_MODE = os.getenv("PIPO_DEMO_MODE", "true").strip().lower() not in ("false", "0", "no")
+DEMO_URL = "demo://s45-test-data"
+
+# interface -> sender, description, QoS, sender channel, receivers [(component, interface, mapping, channel)], routing
+DEMO_SCENARIOS = {
+    "MaterialERPAvailabilityQueryResponse_Out": {
+        "sender_party": "", "sender_component": "BS_Q96_CL100",
+        "namespace": "urn:tooling.sandvik.com:MarketingBusiness:GlobalDataTypes",
+        "description": "Material availability check from Q96 to ERP", "qos": "BestEffort",
+        "sender_channel": "CC_SOAP_Sender_MatAvail", "conditions": False,
+        "receivers": [("BS_ERP_CL300", "MaterialAvailability_In", "OM_MaterialAvailability", "CC_SOAP_Receiver_ERP")]},
+    "TT75_Out": {
+        "sender_party": "", "sender_component": "A17CLNT300",
+        "namespace": "urn:tooling.sandvik.com:TOOLING_SALES_ERP_TT:OTD",
+        "description": "Order-to-delivery status from ERP A17 to the transport tool over SFTP", "qos": "ExactlyOnce",
+        "sender_channel": "CC_IDOC_Sender_A17", "conditions": False,
+        "receivers": [("BS_TT_FILE", "TT75_In", "OM_TT75_to_CSV", "CC_SFTP_Receiver_TT")]},
+    "OrderCreate_Out": {
+        "sender_party": "PARTNER_X", "sender_component": "BS_EDI_GW", "namespace": "urn:partner:orders",
+        "description": "Partner orders routed to ERP or WMS by order type", "qos": "ExactlyOnce",
+        "sender_channel": "CC_AS2_Sender_Orders", "conditions": True,
+        "receivers": [("BS_ERP_CL300", "ORDERS.ORDERS05", "OM_Order_to_ORDERS05", "CC_IDOC_Receiver_ERP"),
+                      ("BS_WMS", "WarehouseOrder_In", "", "CC_JDBC_Receiver_WMS")]},
+}
+# channel -> (adapter, direction, transport, message protocol, attributes). Fake passwords prove redaction works.
+DEMO_CHANNELS = {
+    "CC_SOAP_Sender_MatAvail": ("SOAP", "Sender", "HTTP", "SOAP 1.1", {"XMBWS.DefaultSOAPAction": "query"}),
+    "CC_SOAP_Receiver_ERP": ("SOAP", "Receiver", "HTTP", "SOAP 1.1", {
+        "XMBWS.TargetURL": "http://erp-host:8000/sap/bc/srt/xip/sap/matavail", "XMBWS.User": "RFC_PI_USER",
+        "XMBWS.Password": "fake-secret-1", "XMBWS.Timeout": "60000"}),
+    "CC_IDOC_Sender_A17": ("IDoc_AAE", "Sender", "HTTP", "IDoc", {"rfc.programId": "PI_IDOC_A17"}),
+    "CC_SFTP_Receiver_TT": ("SFTP", "Receiver", "SFTP", "File", {
+        "sftp.host": "tt-sftp.example.local", "sftp.port": "22", "sftp.directory": "/in/tt75",
+        "sftp.fileName": "TT75_%timestamp%.csv", "sftp.password": "fake-secret-2"}),
+    "CC_AS2_Sender_Orders": ("AS2", "Sender", "HTTP", "AS2", {"as2.privateKeyAlias": "partner_key"}),
+    "CC_IDOC_Receiver_ERP": ("IDoc_AAE", "Receiver", "HTTP", "IDoc", {
+        "rfc.client": "300", "rfc.destination": "ERP_CL300", "rfc.password": "fake-secret-3"}),
+    "CC_JDBC_Receiver_WMS": ("JDBC", "Receiver", "JDBC 2.0", "XML SQL Format", {
+        "jdbc.url": "jdbc:sqlserver://wms-db:1433;databaseName=WMS", "jdbc.dbPassword": "fake-secret-4"}),
+}
+
+
+def pipo_demo() -> bool:
+    return PIPO_DEMO_MODE and not pipo_configured()
+
+
+def _ids(tag: str, **kv) -> str:
+    return f"<{tag}>" + "".join(f"<{k}>{_x(v)}</{k}>" for k, v in kv.items()) + f"</{tag}>"
+
+
+def demo_soap_response(path: str, body: str) -> str:
+    """Answer a PI/PO read request from DEMO_SCENARIOS, in the same SOAP shape a real 7.50 system returns."""
+    env = ('<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"><SOAP-ENV:Body>'
+           '<rpl:{op} xmlns:rpl="http://sap.com/xi/BASIS">{body}</rpl:{op}></SOAP-ENV:Body></SOAP-ENV:Envelope>')
+    if path == PIPO_CHANNEL_PATH and "CommunicationChannelReadRequest" in body:
+        out = ""
+        for comp, ch in re.findall(r"<ComponentID>(.*?)</ComponentID><ChannelID>(.*?)</ChannelID>", body):
+            if ch in DEMO_CHANNELS:
+                adapter, direction, tp, mp, attrs = DEMO_CHANNELS[ch]
+                out += ("<CommunicationChannel>" + _ids("CommunicationChannelID", PartyID="", ComponentID=comp, ChannelID=ch)
+                        + f"<AdapterMetadata><Name>{adapter}</Name><Namespace>http://sap.com/xi/XI/System</Namespace>"
+                        f"</AdapterMetadata><Direction>{direction}</Direction><TransportProtocol>{tp}</TransportProtocol>"
+                        f"<MessageProtocol>{mp}</MessageProtocol>"
+                        + "".join(f"<AdapterSpecificAttribute><Name>{k}</Name><Value>{_x(v)}</Value>"
+                                  "</AdapterSpecificAttribute>" for k, v in attrs.items())
+                        + "</CommunicationChannel>")
+        return env.format(op="CommunicationChannelReadResponse", body=out)
+    if path == PIPO_ICO_PATH and "IntegratedConfigurationReadRequest" in body:
+        m = re.search(r"<InterfaceName>(.*?)</InterfaceName>", body)
+        s = DEMO_SCENARIOS.get(m.group(1) if m else "")
+        if not s:
+            return env.format(op="IntegratedConfigurationReadResponse", body="")
+        rcvs = s["receivers"]
+        cond = lambda i: ("<Condition><AtomicConditionBlock><AtomicCondition><LeftExtractor><Value>/Order/Type</Value>"  # noqa: E731
+                          f"</LeftExtractor><Operator>EQ</Operator><RightExtractor><Value>{'STD' if i == 0 else 'WMS'}"
+                          "</Value></RightExtractor></AtomicCondition></AtomicConditionBlock></Condition>"
+                          if s["conditions"] else "")
+        xml = (f'<IntegratedConfiguration><Description><Value languageCode="EN">{_x(s["description"])}</Value></Description>'
+               "<InboundProcessing>" + _ids("CommunicationChannel", PartyID=s["sender_party"],
+                                             ComponentID=s["sender_component"], ChannelID=s["sender_channel"])
+               + "</InboundProcessing><Receivers>"
+               + "".join("<ReceiverRule>" + _ids("Receiver", PartyID="", ComponentID=rc) + cond(i) + "</ReceiverRule>"
+                         for i, (rc, ri, mp, ch) in enumerate(rcvs)) + "</Receivers>"
+               + "".join("<ReceiverInterfaces>" + _ids("Receiver", PartyID="", ComponentID=rc) + "<ReceiverInterfaceRule>"
+                         + (f"<Mapping><Name>{mp}</Name><Namespace>urn:test</Namespace></Mapping>" if mp else "")
+                         + f"<Interface><Name>{ri}</Name><Namespace>urn:test</Namespace></Interface></ReceiverInterfaceRule>"
+                         f"<QualityOfService>{s['qos']}</QualityOfService></ReceiverInterfaces>"
+                         for rc, ri, mp, ch in rcvs)
+               + "".join("<OutboundProcessing>" + _ids("Receiver", PartyID="", ComponentID=rc)
+                         + f"<ReceiverInterface><Name>{ri}</Name></ReceiverInterface>"
+                         + _ids("CommunicationChannel", PartyID="", ComponentID=rc, ChannelID=ch) + "</OutboundProcessing>"
+                         for rc, ri, mp, ch in rcvs) + "</IntegratedConfiguration>")
+        return env.format(op="IntegratedConfigurationReadResponse", body=xml)
+    if path == PIPO_ICO_PATH and "IntegratedConfigurationQueryRequest" in body:
+        return env.format(op="IntegratedConfigurationQueryResponse", body="".join(
+            _ids("IntegratedConfigurationID", SenderPartyID=s["sender_party"], SenderComponentID=s["sender_component"],
+                 InterfaceName=name, InterfaceNamespace=s["namespace"], ReceiverPartyID="", ReceiverComponentID="")
+            for name, s in DEMO_SCENARIOS.items()))
+    return env.format(op="Fault", body="<faultstring>Unknown operation</faultstring>")
+
+
 def _local(tag: str) -> str:
     return tag.split("}")[-1]
 
@@ -741,7 +843,14 @@ def parse_ico_query_response(xml_text: str) -> list[dict]:
     return rows
 
 
+def _pipo_base() -> str:
+    return DEMO_URL if pipo_demo() else PIPO_BASE_URL
+
+
 def _pipo_post(url: str, body: str) -> httpx.Response:
+    if url.startswith(DEMO_URL):
+        return httpx.Response(200, text=demo_soap_response(url[len(DEMO_URL):], body),
+                              request=httpx.Request("POST", url))
     with httpx.Client(timeout=PIPO_TIMEOUT, verify=PIPO_VERIFY_TLS, auth=(PIPO_USER, PIPO_PASSWORD)) as client:
         return client.post(url, content=body.encode("utf-8"),
                            headers={"Content-Type": "text/xml; charset=utf-8", "SOAPAction": '""'})
@@ -749,10 +858,10 @@ def _pipo_post(url: str, body: str) -> httpx.Response:
 
 def fetch_scenarios() -> dict:
     """Read-only query of all Integrated Configurations in the PI/PO Integration Directory."""
-    if not pipo_configured():
+    if not pipo_configured() and not pipo_demo():
         raise PipoError(f"{PIPO_SYSTEM} is not connected here. Get scenarios only works when PIPO2CPI runs on your "
                         f"PC on the company network or VPN, with PIPO_BASE_URL, PIPO_USER and PIPO_PASSWORD set in .env.")
-    url = PIPO_BASE_URL + PIPO_ICO_PATH
+    url = _pipo_base() + PIPO_ICO_PATH
     host = urlparse(url).netloc
     try:
         r = _pipo_post(url, ICO_QUERY_ENVELOPE)
@@ -780,7 +889,7 @@ def fetch_scenarios() -> dict:
         raise PipoError(f"{PIPO_SYSTEM} answered with HTTP {r.status_code} but not SOAP XML. Check PIPO_BASE_URL.")
     if r.status_code >= 400:
         raise PipoError(f"{PIPO_SYSTEM} returned HTTP {r.status_code}.")
-    return {"system": PIPO_SYSTEM, "count": len(rows), "scenarios": rows,
+    return {"system": PIPO_SYSTEM, "count": len(rows), "scenarios": rows, "demo": pipo_demo(),
             "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
 
 
@@ -814,7 +923,7 @@ def _soap(body_xml: str) -> str:
 
 def _pipo_call(path: str, envelope: str, what: str) -> ET.Element:
     """POST a read request; map transport/HTTP problems to PipoError; return the parsed XML root."""
-    url = PIPO_BASE_URL + path
+    url = _pipo_base() + path
     host = urlparse(url).netloc
     try:
         r = _pipo_post(url, envelope)
@@ -933,7 +1042,8 @@ def render_po_export(row: dict, info: dict) -> str:
             parts.append("; ".join(f"{k}={v}" for k, v in a["attributes"].items()))
         return ", ".join(parts)
 
-    lines = [f"Source: {PIPO_SYSTEM} Integration Directory (read-only)",
+    lines = [f"Source: {PIPO_SYSTEM} built-in test data (not a real system)" if pipo_demo()
+             else f"Source: {PIPO_SYSTEM} Integration Directory (read-only)",
              f"Integrated Configuration: {row['scenario_string']}"]
     if info["description"]:
         lines.append(f"Description: {info['description']}")
@@ -953,7 +1063,7 @@ def render_po_export(row: dict, info: dict) -> str:
 
 def fetch_scenario_details(row: dict) -> dict:
     """Read one ICo and its channels from the PI/PO system; returns structured info plus po_export text."""
-    if not pipo_configured():
+    if not pipo_configured() and not pipo_demo():
         raise PipoError(f"{PIPO_SYSTEM} is not connected here, so scenario details cannot be read.")
     row = {k: str(row.get(k, "") or "") for k in _ICO_KEYS}
     if not row["interface"]:
@@ -991,13 +1101,13 @@ def fetch_scenario_details(row: dict) -> dict:
         except PipoError as exc:
             warnings.append(f"Channel details unavailable: {exc}")
     return {"system": PIPO_SYSTEM, "scenario": row, "details": info, "po_export": render_po_export(row, info),
-            "warnings": warnings}
+            "warnings": warnings, "demo": pipo_demo()}
 
 
 def describe() -> dict:
     return {
         "app": APP_NAME, "model": MODEL, "configured": is_configured(),
-        "pipo": {"system": PIPO_SYSTEM, "configured": pipo_configured()},
+        "pipo": {"system": PIPO_SYSTEM, "configured": pipo_configured(), "demo": pipo_demo()},
         "pipeline": [{"key": k, "title": AGENTS[k].title, "agent_type": AGENTS[k].agent_type,
                       "description": AGENTS[k].description, "tools": AGENTS[k].tools, "gate": AGENTS[k].gate}
                      for k in PIPELINE],
@@ -1284,15 +1394,34 @@ def _raises_pipo(fn) -> tuple[bool, str]:
 
 
 def _not_configured_message() -> tuple[bool, str]:
-    global PIPO_BASE_URL
-    saved, PIPO_BASE_URL = PIPO_BASE_URL, ""
+    global PIPO_BASE_URL, PIPO_DEMO_MODE
+    saved = PIPO_BASE_URL, PIPO_DEMO_MODE
+    PIPO_BASE_URL, PIPO_DEMO_MODE = "", False
     try:
         fetch_scenarios()
         return False, "no error raised"
     except PipoError as exc:
         return "company network" in str(exc), str(exc)
     finally:
-        PIPO_BASE_URL = saved
+        PIPO_BASE_URL, PIPO_DEMO_MODE = saved
+
+
+def _demo_case() -> tuple[bool, str]:
+    """Without S45 settings, Get scenarios serves the built-in test data through the real parsers."""
+    global PIPO_BASE_URL, PIPO_DEMO_MODE
+    saved = PIPO_BASE_URL, PIPO_DEMO_MODE
+    PIPO_BASE_URL, PIPO_DEMO_MODE = "", True
+    try:
+        res = fetch_scenarios()
+        row = next(r for r in res["scenarios"] if r["interface"] == "OrderCreate_Out")
+        d = fetch_scenario_details(row)
+        text = d["po_export"]
+        pattern = json.loads(detect_pattern.invoke({"ico_text": text}))["pattern"]
+        ok = (res["demo"] and res["count"] == len(DEMO_SCENARIOS) and "test data" in text
+              and pattern == "Content-Based Routing" and "fake-secret" not in text and "RFC_PI_USER" not in text)
+        return ok, f"{res['count']} test scenarios, OrderCreate_Out pattern={pattern}"
+    finally:
+        PIPO_BASE_URL, PIPO_DEMO_MODE = saved
 
 
 def _case(name: str, category: str, fn) -> dict:
@@ -1388,6 +1517,7 @@ def _deterministic_cases() -> list[dict]:
             '<e:Envelope xmlns:e="http://schemas.xmlsoap.org/soap/envelope/"><e:Body><e:Fault>'
             '<faultstring>No authorization</faultstring></e:Fault></e:Body></e:Envelope>'))),
         _case("Get scenarios without S45 settings explains local-only", "pipo", _not_configured_message),
+        _case("Without S45 settings, test scenarios are served and parsed", "pipo", _demo_case),
         _case("Scenario details parsed, passwords dropped, pattern detected", "pipo", _details_case),
         _case("Output validator catches missing keys", "loop", lambda: (
             validate_output({"summary": "x"}, AGENTS["test"].schema) != [], "caught")),
