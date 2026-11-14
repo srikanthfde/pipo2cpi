@@ -655,7 +655,12 @@ _register(AgentSpec(
             '"likely_cause":"Wrong security material","fix":"Check credential name"}]}',
     constraints="If mpl_error is given, call classify_mpl_error. interface_spec is short markdown (purpose, sender, "
                 "receiver, pattern, mappings, parameters, owner). tracker_row.ico must be the wizard_prep "
-                "scenario_string copied exactly; never rebuild it.",
+                "scenario_string copied exactly; never rebuild it. Take receivers, adapters and Security Material "
+                "names from prior_stage_outputs; write unknown only when they are absent there. po_system (for "
+                "example S45) is the PI/PO middleware, never the sender backend; the sender is sender_component. "
+                "Only list alerts and errors that fit this scenario's adapters: SFTP verifies hosts with known_hosts, "
+                "so no PKIX/SSL certificate errors for SFTP; those apply to HTTPS-based adapters (SOAP, HTTP, "
+                "IDoc, AS2, OData).",
     schema={"alerts": "list of strings", "error_triage": "list of {error, category, likely_cause, fix}",
             "interface_spec": "markdown string", "tracker_row": "{ico, iflow_id, pattern, wave, status, verdict}",
             "cutover_checklist": "list of strings", "summary": "max 2 sentences"},
@@ -1016,16 +1021,33 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: max(limit - 40, 0)] + f"\n...[truncated {len(text) - limit} chars]"
 
 
+# Facts a downstream-of-everything agent must not lose. Lists of objects are reduced to the named sub-keys.
+SUMMARY_KEYS = ("summary", "detected_pattern", "wave", "iflow_id", "verdict", "complexity", "scenario_string",
+                "po_system", "sender_component", "receivers", "adapters", "security_materials", "cloud_connector")
+SUMMARY_SUBKEYS = {"adapters": ("po", "cpi"), "security_materials": ("name", "type"),
+                   "cloud_connector": ("required", "location_id")}
+
+
+def _compact(key: str, value):
+    keep = SUMMARY_SUBKEYS.get(key)
+    if not keep:
+        return value
+    if isinstance(value, list):
+        return [{k: v[k] for k in keep if k in v} if isinstance(v, dict) else v for v in value]
+    if isinstance(value, dict):
+        return {k: value[k] for k in keep if k in value}
+    return value
+
+
 def _summarize_prior(spec: AgentSpec, prior: dict, budget: int) -> str:
-    """Pass only the stages this agent needs; downstream-of-everything agents get summaries only."""
+    """Pass only the stages this agent needs; downstream-of-everything agents get compact key facts only."""
     picked = {}
     for key in spec.needs:
         out = prior.get(key)
         if not isinstance(out, dict):
             continue
         if len(spec.needs) > 3:
-            picked[key] = {k: out[k] for k in ("summary", "detected_pattern", "wave", "iflow_id", "verdict",
-                                                "complexity", "scenario_string") if k in out}
+            picked[key] = {k: _compact(k, out[k]) for k in SUMMARY_KEYS if k in out}
         else:
             picked[key] = {k: v for k, v in out.items() if k != "groovy_scripts"}
     return _clip(json.dumps(picked, ensure_ascii=False, indent=1), budget) if picked else ""
@@ -1289,6 +1311,23 @@ def _raises_guardrail(fn) -> tuple[bool, str]:
     return False, "no guardrail triggered"
 
 
+def _monitor_context_case():
+    long = "x" * 400
+    prior = {
+        "assessment": {"summary": "IDoc to SFTP, wave 2.", "receivers": ["BS_TT_FILE"], "detected_pattern": "Point-to-Point Asynchronous",
+                       "adapters": [{"po": "SFTP", "cpi": "SFTP", "notes": long}], "blockers": [long] * 5, "wave": 2},
+        "wizard_prep": {"scenario_string": "|A17CLNT300|TT75_Out|urn:x||", "iflow_id": "TT75",
+                        "wizard_steps": [{"step": long}] * 10},
+        "config": {"security_materials": [{"name": "TT_SFTP_User", "type": "User Credentials", "purpose": long}],
+                   "cloud_connector": {"required": True, "location_id": "RISE_CD1", "virtual_host_hint": long},
+                   "deploy_plan": [long] * 9},
+    }
+    text = _summarize_prior(AGENTS["monitor_docs"], prior, int(CONTEXT_BUDGET * 0.25))
+    need = ("BS_TT_FILE", "TT_SFTP_User", "RISE_CD1", "|A17CLNT300|TT75_Out|urn:x||", "SFTP")
+    ok = all(n in text for n in need) and "truncated" not in text and long not in text
+    return ok, f"{len(text)} chars, missing: {[n for n in need if n not in text]}"
+
+
 def _deterministic_cases() -> list[dict]:
     t = lambda name, args: json.loads(ALL_TOOLS[name].invoke(args))  # noqa: E731
     return [
@@ -1338,6 +1377,7 @@ def _deterministic_cases() -> list[dict]:
         _case("Context respects budget and stage fields", "context", lambda: (lambda m: (
             len(m[0]) < CONTEXT_BUDGET + 600 and "mapping_code" not in m[0], len(m[0])))(
             build_context(AGENTS["wizard_prep"], dict(GOLDEN_ICO, mapping_code="x" * 50000), {}))),
+        _case("Monitor stage keeps receivers and security material names", "context", _monitor_context_case),
         _case("Every stage prompt has all six parts", "context", lambda: (all(
             all(h in system_prompt(AGENTS[k]) for h in ("# Role", "# Task", "# Context", "# Example",
                                                          "# Constraints", "# Output format")) for k in PIPELINE), "ok")),
